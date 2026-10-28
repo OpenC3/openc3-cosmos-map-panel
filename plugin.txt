@@ -1,0 +1,3 @@
+# Adds the MAP panel type to the Dashboards tool. The bundle is built to
+# tools/panels/MAP/MAP.js by `pnpm build` (rake build runs it for you).
+PANEL MAP

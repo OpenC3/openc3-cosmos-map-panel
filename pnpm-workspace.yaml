@@ -1,0 +1,6 @@
+minimumReleaseAge: 1440 # 1 day
+
+# pnpm 11 fails installs on unapproved build scripts. esbuild's postinstall
+# only validates the binary its platform package already provides.
+allowBuilds:
+  esbuild: false
