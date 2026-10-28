@@ -1,5 +1,9 @@
 # OpenC3 COSMOS Map Panel
 
+<p align="center">
+  <img src="public/store_img.png" alt="Map panel" />
+</p>
+
 A 2D map panel for the COSMOS **Dashboards** tool (beta), and the sample to copy
 when building your own dashboard panels as plugins.
 
