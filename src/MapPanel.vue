@@ -71,6 +71,25 @@ import {
 const OSM_TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 const OSM_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+// The one world everything is drawn on
+const WORLD = [
+  [-90, -180],
+  [90, 180],
+]
+
+// Trail widths in CSS pixels at the marker: a bright line over a soft glow
+const TRAIL_PX = 2.5
+const TRAIL_GLOW_PX = 7
+const TRAIL_GLOW_OPACITY = 0.25
+// How dim the oldest end of a trail gets (0 to 1)
+const TRAIL_TAIL = 0.15
+// How thin the oldest end gets, as a share of the width at the marker
+const TRAIL_TAIL_WIDTH = 0.2
+// Steps of the fade: each is one stroke on the canvas
+const TRAIL_BANDS = 24
+// Points closer than this on screen to the last one drawn are skipped, so a
+// long or dense trail costs what its on-screen length does
+const TRAIL_STEP_PX = 1.5
 
 // Leaflet's stylesheet travels inside this bundle; add it once per page
 function addLeafletCss() {
@@ -81,14 +100,145 @@ function addLeafletCss() {
   document.head.appendChild(style)
 }
 
-// Keep a trail continuous across the antimeridian (179° -> -179° becomes
-// 179° -> 181°) so it doesn't draw a line across the whole map
+// Keep a track continuous across the antimeridian (179° -> -179° becomes
+// 179° -> 181°) so it can be split cleanly where it crosses (wrapRuns)
 function unwrap(previous, lon) {
   if (previous === undefined) return lon
   while (lon - previous > 180) lon -= 360
   while (lon - previous < -180) lon += 360
   return lon
 }
+
+// Any longitude to -180..180
+function wrapLon(lon) {
+  return ((((lon + 180) % 360) + 360) % 360) - 180
+}
+
+// Which copy of the world a continuous longitude is on (0 is -180..180)
+function worldOf(lon) {
+  return Math.floor((lon + 180) / 360)
+}
+
+// Points [lat, lon] with continuous longitudes (unwrap) and an age each, as
+// runs of [lat, lon, age] on the one world: a run ends at the edge where the
+// track crosses the antimeridian and the next starts at the other edge.
+function wrapRuns(points, ages) {
+  const runs = []
+  let run = null
+  let previousWorld = null
+  points.forEach(([lat, lon], i) => {
+    const world = worldOf(lon)
+    if (run && world !== previousWorld) {
+      const [lat0, lon0] = points[i - 1]
+      const edge = -180 + 360 * Math.max(world, previousWorld)
+      const t = (edge - lon0) / (lon - lon0)
+      const edgeLat = lat0 + (lat - lat0) * t
+      const edgeAge = ages[i - 1] + (ages[i] - ages[i - 1]) * t
+      run.push([edgeLat, edge - 360 * previousWorld, edgeAge])
+      run = [[edgeLat, edge - 360 * world, edgeAge]]
+      runs.push(run)
+    }
+    if (!run) {
+      run = []
+      runs.push(run)
+    }
+    run.push([lat, lon - 360 * world, ages[i]])
+    previousWorld = world
+  })
+  return runs
+}
+
+// One run of a trail, fading and thinning toward its oldest end. Each band
+// of age is one path, so a trail is at most TRAIL_BANDS strokes.
+function strokeRun(context, run, project, width, opacity) {
+  let last = null
+  let band = -1
+  const stroke = () => {
+    const age = (band + 1) / TRAIL_BANDS
+    context.lineWidth =
+      width * (TRAIL_TAIL_WIDTH + (1 - TRAIL_TAIL_WIDTH) * age)
+    context.globalAlpha =
+      opacity * (TRAIL_TAIL + (1 - TRAIL_TAIL) * Math.pow(age, 0.8))
+    context.stroke()
+  }
+  context.beginPath()
+  run.forEach(([lat, lon, age], i) => {
+    const point = project(lat, lon)
+    if (
+      last &&
+      i < run.length - 1 &&
+      Math.abs(point.x - last.x) + Math.abs(point.y - last.y) < TRAIL_STEP_PX
+    ) {
+      return
+    }
+    const next = Math.min(TRAIL_BANDS - 1, Math.floor(age * TRAIL_BANDS))
+    if (!last) {
+      context.moveTo(point.x, point.y)
+    } else {
+      if (next !== band && band >= 0) {
+        stroke()
+        context.beginPath()
+        context.moveTo(last.x, last.y)
+      }
+      context.lineTo(point.x, point.y)
+    }
+    band = next
+    last = point
+  })
+  if (last && band >= 0) stroke()
+}
+
+// Every trail on one canvas over the map: thousands of points stay quick
+// to move, pan and zoom, where a Leaflet polyline per segment wouldn't.
+// `draw(context, project)` paints them; render() at most once a frame.
+const TrailCanvas = L.Layer.extend({
+  initialize(draw, options) {
+    L.setOptions(this, options)
+    this.draw = draw
+    this.frame = null
+  },
+  onAdd(map) {
+    // Hidden while Leaflet animates a zoom, then redrawn at the new zoom
+    this.canvas = L.DomUtil.create('canvas', 'map-trails leaflet-zoom-hide')
+    this.getPane().appendChild(this.canvas)
+    map.on('move zoomend viewreset resize', this.redraw, this)
+    this.render()
+  },
+  onRemove(map) {
+    map.off('move zoomend viewreset resize', this.redraw, this)
+    cancelAnimationFrame(this.frame)
+    this.frame = null
+    this.canvas.remove()
+  },
+  redraw() {
+    this.frame ??= requestAnimationFrame(() => this.render())
+  },
+  render() {
+    cancelAnimationFrame(this.frame)
+    this.frame = null
+    const map = this._map
+    if (!map) return
+    const size = map.getSize()
+    const ratio = window.devicePixelRatio || 1
+    const canvas = this.canvas
+    const width = Math.round(size.x * ratio)
+    const height = Math.round(size.y * ratio)
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width
+      canvas.height = height
+      canvas.style.width = `${size.x}px`
+      canvas.style.height = `${size.y}px`
+    }
+    // The pane moves with the map; keep the canvas over the view
+    L.DomUtil.setPosition(canvas, map.containerPointToLayerPoint([0, 0]))
+    const context = canvas.getContext('2d')
+    context.setTransform(ratio, 0, 0, ratio, 0, 0)
+    context.clearRect(0, 0, size.x, size.y)
+    context.lineCap = 'round'
+    context.lineJoin = 'round'
+    this.draw(context, (lat, lon) => map.latLngToContainerPoint([lat, lon]))
+  },
+})
 
 function formatPosition(position) {
   if (position.lat === null) return '--'
@@ -156,14 +306,20 @@ const legend = computed(() =>
 let map = null
 let base = null
 let locationLayer = null
+let trailCanvas = null
 let resizeObserver = null
 let frame = null
-// position index => { marker, trail, head } Leaflet layers
-let layers = {}
-// position index => [[lat, lon], ...] oldest first, from the series
+// position index => circle marker
+let markers = {}
+// position index => [[lat, lon], ...] oldest first, from the series, with
+// continuous longitudes (unwrap) lined up with the marker's
 let trails = {}
+// position index => the trail but its newest point as runs on the one world
+// (wrapRuns), ready to draw every frame
+let trailRuns = {}
 // Where each marker is drawn while it glides to its newest point,
-// { from, to, at, start, duration } per position index
+// { from, to, at, start, duration } per position index, with continuous
+// longitudes like the trails
 let motion = {}
 let lastMove = null
 
@@ -171,6 +327,7 @@ watch(positions, () => {
   move()
   draw()
 })
+watch(showTrail, () => trailCanvas?.redraw())
 watch(tiles, () => setTiles())
 watch(locations, () => drawLocations())
 // Re-measure after anything that can change the map's box
@@ -181,13 +338,18 @@ onMounted(() => {
   map = L.map(mapEl.value, {
     center: [0, 0],
     zoom: sdk.option(props.panel, 'ZOOM'),
-    worldCopyJump: true,
+    // One world: no copies to either side for a track to run onto
+    maxBounds: WORLD,
+    maxBoundsViscosity: 1,
     attributionControl: true,
   })
   map.on('dragstart', () => {
     following.value = false
   })
   setTiles()
+  // Under the markers and locations (overlayPane is 400)
+  map.createPane('trails').style.zIndex = 390
+  trailCanvas = new TrailCanvas(drawTrails, { pane: 'trails' }).addTo(map)
   locationLayer = L.layerGroup().addTo(map)
   drawLocations()
   resizeObserver = new ResizeObserver(() => map.invalidateSize())
@@ -200,6 +362,7 @@ onUnmounted(() => {
   resizeObserver?.disconnect()
   map?.remove()
   map = null
+  trailCanvas = null
 })
 
 function setTiles() {
@@ -210,6 +373,8 @@ function setTiles() {
   } else {
     base = L.tileLayer(tiles.value || OSM_TILES, {
       maxZoom: 19,
+      noWrap: true,
+      bounds: WORLD,
       attribution: tiles.value ? '' : OSM_ATTRIBUTION,
     })
   }
@@ -223,14 +388,14 @@ function graticule() {
     lines.push(
       L.polyline(
         [
-          [lat, -540],
-          [lat, 540],
+          [lat, -180],
+          [lat, 180],
         ],
         style,
       ),
     )
   }
-  for (let lon = -540; lon <= 540; lon += 30) {
+  for (let lon = -180; lon <= 180; lon += 30) {
     lines.push(
       L.polyline(
         [
@@ -248,7 +413,7 @@ function drawLocations() {
   if (!locationLayer) return
   locationLayer.clearLayers()
   for (const location of locations.value) {
-    L.circleMarker([location.lat, location.lon], {
+    L.circleMarker([location.lat, wrapLon(location.lon)], {
       radius: 4,
       weight: 2,
       color: '#b8ffd6',
@@ -267,10 +432,11 @@ function drawLocations() {
   }
 }
 // Trails from the series, each lined up with its marker's longitude so the
-// two meet on the same copy of the world
+// head segment meets the marker without a jump
 function updateTrails() {
   const size = trackSize(coordinates.value)
   trails = {}
+  trailRuns = {}
   history(series, size, duration.value).forEach((track, index) => {
     let previous
     const points = track.map(({ values }) => {
@@ -281,10 +447,17 @@ function updateTrails() {
     const last = points.at(-1)
     if (last) {
       const shift =
-        Math.round(((motion[index]?.to[1] ?? 0) - last[1]) / 360) * 360
+        Math.round(((motion[index]?.to[1] ?? last[1]) - last[1]) / 360) * 360
       if (shift) for (const point of points) point[1] += shift
     }
     trails[index] = points
+    // Age 0 at the oldest point, 1 at the newest (where the marker heads)
+    const n = points.length
+    const shown = points.slice(0, -1)
+    trailRuns[index] = wrapRuns(
+      shown,
+      shown.map((_, i) => i / (n - 1)),
+    )
   })
 }
 // Glide each marker to its newest point: the end of its trail, or the
@@ -305,16 +478,11 @@ function move() {
       continue
     }
     const current = motion[index]
-    const lon = unwrap(current?.to[1], point[1])
-    if (current && current.to[0] === point[0] && current.to[1] === lon) {
+    const to = [point[0], unwrap(current?.to[1], point[1])]
+    if (current && current.to[0] === to[0] && current.to[1] === to[1]) {
       continue
     }
-    // Keep longitudes within a turn of the map: after many orbits they
-    // would drift into far world copies and the view would jump
-    const shift = lon > 180 ? -360 : lon < -180 ? 360 : 0
-    if (shift) for (const p of trails[index] || []) p[1] += shift
-    const to = [point[0], lon + shift]
-    const from = current ? [current.at[0], current.at[1] + shift] : to
+    const from = current ? current.at : to
     motion[index] = {
       from,
       to,
@@ -340,83 +508,88 @@ function animate() {
   placeMarkers()
   if (moving) frame = requestAnimationFrame(animate)
 }
-// The trail up to the newest point but one; the head draws the last
-// segment, out to the gliding marker
-function trailLine(index) {
-  return showTrail.value ? (trails[index] || []).slice(0, -1) : []
+// Where a marker is drawn: its gliding position on the one world
+function markerPoint(index) {
+  const at = motion[index]?.at
+  return at ? [at[0], wrapLon(at[1])] : null
 }
-function headLine(index, at) {
-  const previous = trails[index]?.at(-2)
-  return previous && showTrail.value ? [previous, at] : []
+// Each trail, then its last segment out to the gliding marker
+function drawTrails(context, project) {
+  if (!showTrail.value) return
+  for (const position of positions.value) {
+    const index = position.index
+    const trail = trails[index]
+    if (!trail) continue
+    const runs = [...(trailRuns[index] || [])]
+    const previous = trail.at(-2)
+    const at = motion[index]?.at
+    if (previous && at) {
+      runs.push(
+        ...wrapRuns(
+          [previous, at],
+          [(trail.length - 2) / (trail.length - 1), 1],
+        ),
+      )
+    }
+    context.strokeStyle = position.color
+    for (const run of runs) {
+      strokeRun(context, run, project, TRAIL_GLOW_PX, TRAIL_GLOW_OPACITY)
+      strokeRun(context, run, project, TRAIL_PX, 1)
+    }
+  }
 }
-// Markers and the last trail segment at their gliding positions
+// Markers and the trails' last segments at their gliding positions
 function placeMarkers() {
   if (!map) return
   const points = []
-  for (const [index, layer] of Object.entries(layers)) {
-    const at = motion[index]?.at
-    if (!at || !map.hasLayer(layer.marker)) continue
-    layer.marker.setLatLng(at)
-    layer.head.setLatLngs(headLine(index, at))
-    points.push(at)
+  for (const [index, marker] of Object.entries(markers)) {
+    const point = markerPoint(index)
+    if (!point || !map.hasLayer(marker)) continue
+    marker.setLatLng(point)
+    points.push(point)
   }
   // One position is kept centered as it moves; several are kept in view
   // when drawn (fitting them every frame would keep zooming)
   if (follow.value && following.value && points.length === 1) {
     map.panTo(points[0], { animate: false })
   }
-}
-function removeLayer(index) {
-  const layer = layers[index]
-  layer.marker.remove()
-  layer.trail.remove()
-  layer.head.remove()
-  delete layers[index]
+  // Now, not next frame, so the head stays on the marker
+  trailCanvas?.render()
 }
 function draw() {
   if (!map) return
   const shown = []
   const indexes = new Set(positions.value.map((p) => String(p.index)))
-  for (const index of Object.keys(layers)) {
-    if (!indexes.has(index)) removeLayer(index)
+  for (const index of Object.keys(markers)) {
+    if (!indexes.has(index)) {
+      markers[index].remove()
+      delete markers[index]
+    }
   }
   for (const position of positions.value) {
     const index = position.index
-    let layer = layers[index]
-    if (!layer) {
-      layer = {
-        trail: L.polyline([], { weight: 2, opacity: 0.8 }).addTo(map),
-        // From the newest point but one to the gliding marker
-        head: L.polyline([], { weight: 2, opacity: 0.8 }).addTo(map),
-        marker: L.circleMarker([0, 0], {
-          radius: 7,
-          weight: 2,
-          fillOpacity: 0.9,
-        })
-          .bindTooltip('', { direction: 'top', offset: [0, -8] })
-          // Looked up on click, so it follows the panel's current items
-          .on('click', () => details(positions.value[index])),
-      }
-      layers[index] = layer
-    }
-    layer.trail.setStyle({ color: position.color })
-    layer.head.setStyle({ color: position.color })
-    layer.trail.setLatLngs(trailLine(index))
-    const point = motion[index]?.at
+    const marker = (markers[index] ??= L.circleMarker([0, 0], {
+      radius: 7,
+      weight: 2,
+      fillOpacity: 0.9,
+    })
+      .bindTooltip('', { direction: 'top', offset: [0, -8] })
+      // Looked up on click, so it follows the panel's current items
+      .on('click', () => details(positions.value[index])))
+    const point = markerPoint(index)
     if (!point) {
-      layer.marker.remove()
-      layer.head.setLatLngs([])
+      marker.remove()
       continue
     }
-    layer.head.setLatLngs(headLine(index, point))
-    layer.marker
+    marker
       .setLatLng(point)
       .setStyle({ color: '#ffffff', fillColor: position.color })
       .setTooltipContent(`${position.label}<br>${formatPosition(position)}`)
-    if (!map.hasLayer(layer.marker)) layer.marker.addTo(map)
+    if (!map.hasLayer(marker)) marker.addTo(map)
     shown.push(point)
   }
   if (follow.value && following.value && shown.length) keepInView(shown)
+  trailCanvas?.redraw()
 }
 // Center on a single position; fit several when any leaves the view
 function keepInView(points) {
@@ -465,6 +638,9 @@ function details(position) {
 }
 .map :deep(.leaflet-control-attribution a) {
   color: inherit;
+}
+.map :deep(.map-trails) {
+  pointer-events: none;
 }
 .map :deep(.fixed-location) {
   filter: drop-shadow(0 0 3px #4dd88a)

@@ -60,43 +60,53 @@ export function positions(states, coordinates) {
   return result
 }
 
-// Most points drawn in one trail, however long the time range
+// Most points kept in one trail, however long the time range
 export const MAX_TRAIL_POINTS = 2000
 
 // Each position's history from a useTlmSeries series ([times in seconds,
 // then one array of values per item], oldest first), grouped every `size`
 // items: [[{ time, values }]] oldest first. Items that update apart (lat and
 // lon from different packets) carry their last value forward. Long histories
-// keep the first sample in each of MAX_TRAIL_POINTS slices of `seconds`; the
+// keep the first sample in each of `maxPoints` slices of `seconds`; the
 // slices are fixed in time, so kept points stay put as the trail moves on.
-export function history(series, size, seconds) {
+// Runs every series update over every row, so the loop allocates only for
+// the points it keeps.
+export function history(series, size, seconds, maxPoints = MAX_TRAIL_POINTS) {
   const [times, ...columns] = series
-  const slice = seconds / MAX_TRAIL_POINTS
+  const slice = seconds / maxPoints
   const result = []
   for (let i = 0; i + size <= columns.length; i += size) {
     const group = columns.slice(i, i + size)
     const values = new Array(size).fill(null)
+    let missing = size
     const track = []
-    let newest = null
+    let newestTime = null
     let lastSlice = null
-    times.forEach((time, row) => {
+    let lastKept = null
+    for (let row = 0; row < times.length; row++) {
       let changed = false
-      group.forEach((column, j) => {
-        if (typeof column[row] === 'number') {
-          values[j] = column[row]
-          changed = true
-        }
-      })
-      if (!changed || values.includes(null)) return
-      newest = { time, values: [...values] }
+      for (let j = 0; j < size; j++) {
+        const value = group[j][row]
+        if (typeof value !== 'number') continue
+        if (values[j] === null) missing--
+        values[j] = value
+        changed = true
+      }
+      if (!changed || missing) continue
+      const time = times[row]
+      newestTime = time
       const timeSlice = Math.floor(time / slice)
       if (timeSlice !== lastSlice) {
         lastSlice = timeSlice
-        track.push(newest)
+        lastKept = time
+        track.push({ time, values: values.slice() })
       }
-    })
-    // Always end on the newest, so the trail reaches the position
-    if (newest && track.at(-1) !== newest) track.push(newest)
+    }
+    // Always end on the newest, so the trail reaches the position. Values
+    // only change on complete rows from then on, so they're the newest.
+    if (newestTime !== null && lastKept !== newestTime) {
+      track.push({ time: newestTime, values: values.slice() })
+    }
     result.push(track)
   }
   return result
